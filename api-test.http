@@ -1,0 +1,259 @@
+###############################################################################
+# Tupay API — verification collection
+#
+# Works in VS Code (REST Client), JetBrains HTTP Client, or any .http runner.
+#
+# BEFORE YOU START
+#   php artisan migrate:fresh --seed
+#   php artisan serve
+#
+# TOTP codes rotate every 30 seconds and cannot be hard-coded. Get a live one:
+#   php artisan tupay:totp trader@tupay.test
+#
+# Seeded users (password "password" for all):
+#   trader@tupay.test  — comfortably funded, general purpose
+#   whale@tupay.test   — 50,000,000 NGN, exercises tiered slippage
+#   thin@tupay.test    — exactly one swap's worth, used by the race test
+###############################################################################
+
+@host = http://127.0.0.1:8000
+@contentType = application/json
+
+### -------------------------------------------------------------------------
+### 1. LOGIN — exchange credentials for a Sanctum bearer token
+### -------------------------------------------------------------------------
+# @name login
+POST {{host}}/api/login
+Content-Type: {{contentType}}
+Accept: {{contentType}}
+
+{
+  "email": "trader@tupay.test",
+  "password": "password",
+  "device_name": "api-test"
+}
+
+###
+@bearer = {{login.response.body.access_token}}
+
+### -------------------------------------------------------------------------
+### 2. LOGIN FAILURE — wrong password must not reveal whether the user exists
+### Expect: 422
+### -------------------------------------------------------------------------
+POST {{host}}/api/login
+Content-Type: {{contentType}}
+Accept: {{contentType}}
+
+{
+  "email": "trader@tupay.test",
+  "password": "wrong-password"
+}
+
+### -------------------------------------------------------------------------
+### 3. SWAP WITHOUT ELEVATION — bearer token alone is NOT enough
+### Expect: 401 elevated_token_missing
+### -------------------------------------------------------------------------
+POST {{host}}/api/swap
+Authorization: Bearer {{bearer}}
+Content-Type: {{contentType}}
+Accept: {{contentType}}
+
+{
+  "source_currency": "NGN",
+  "target_currency": "CNY",
+  "amount_subunits": 1000000
+}
+
+### -------------------------------------------------------------------------
+### 4. 2FA CHALLENGE — spend a TOTP code, receive an action-bound EAT
+###
+### Replace totp_code with the output of:
+###   php artisan tupay:totp trader@tupay.test
+###
+### Expect: 201 with elevated_action_token + a 64-char action_hash
+### -------------------------------------------------------------------------
+# @name challenge
+POST {{host}}/api/2fa/challenge
+Authorization: Bearer {{bearer}}
+Content-Type: {{contentType}}
+Accept: {{contentType}}
+
+{
+  "totp_code": "REPLACE_ME",
+  "action": "swap",
+  "action_payload": {
+    "source_currency": "NGN",
+    "target_currency": "CNY",
+    "amount_subunits": 1000000
+  }
+}
+
+###
+@eat = {{challenge.response.body.elevated_action_token}}
+
+### -------------------------------------------------------------------------
+### 5. SWAP — succeeds, and consumes the EAT
+### Expect: 200 with the four-leg posting reflected in `balances`
+### -------------------------------------------------------------------------
+POST {{host}}/api/swap
+Authorization: Bearer {{bearer}}
+X-Elevated-Action-Token: {{eat}}
+Content-Type: {{contentType}}
+Accept: {{contentType}}
+
+{
+  "source_currency": "NGN",
+  "target_currency": "CNY",
+  "amount_subunits": 1000000
+}
+
+### -------------------------------------------------------------------------
+### 6. REPLAY THE SAME EAT — the single-use guarantee
+### Run this immediately after #5, well inside the 60-second TTL.
+### Expect: 401 elevated_token_replayed
+### -------------------------------------------------------------------------
+POST {{host}}/api/swap
+Authorization: Bearer {{bearer}}
+X-Elevated-Action-Token: {{eat}}
+Content-Type: {{contentType}}
+Accept: {{contentType}}
+
+{
+  "source_currency": "NGN",
+  "target_currency": "CNY",
+  "amount_subunits": 1000000
+}
+
+### -------------------------------------------------------------------------
+### 7. PARAMETER SUBSTITUTION — mint a fresh EAT for 1,000,000 kobo, then try
+### to spend it on 100x that amount. This is the attack the action hash exists
+### to stop.
+###
+### Run challenge (#4) again for a fresh token first.
+### Expect: 422 elevated_token_action_mismatch
+### -------------------------------------------------------------------------
+POST {{host}}/api/swap
+Authorization: Bearer {{bearer}}
+X-Elevated-Action-Token: {{eat}}
+Content-Type: {{contentType}}
+Accept: {{contentType}}
+
+{
+  "source_currency": "NGN",
+  "target_currency": "CNY",
+  "amount_subunits": 100000000
+}
+
+### -------------------------------------------------------------------------
+### 8. FORGED TOKEN — a structurally invalid EAT
+### Expect: 401 elevated_token_malformed
+### -------------------------------------------------------------------------
+POST {{host}}/api/swap
+Authorization: Bearer {{bearer}}
+X-Elevated-Action-Token: not-a-real-token
+Content-Type: {{contentType}}
+Accept: {{contentType}}
+
+{
+  "source_currency": "NGN",
+  "target_currency": "CNY",
+  "amount_subunits": 1000000
+}
+
+### -------------------------------------------------------------------------
+### 9. LEDGER — paginated, newest first, with the DERIVED balance
+### Get a wallet id from the `balances` in #5, or query the wallets table.
+### Expect: 200
+### -------------------------------------------------------------------------
+GET {{host}}/api/ledger/REPLACE_WITH_WALLET_UUID?per_page=5
+Authorization: Bearer {{bearer}}
+Accept: {{contentType}}
+
+### -------------------------------------------------------------------------
+### 10. LEDGER — next page via the keyset cursor
+### Use pagination.next_cursor from #9.
+### -------------------------------------------------------------------------
+GET {{host}}/api/ledger/REPLACE_WITH_WALLET_UUID?per_page=5&cursor=REPLACE_WITH_CURSOR
+Authorization: Bearer {{bearer}}
+Accept: {{contentType}}
+
+### -------------------------------------------------------------------------
+### 11. LEDGER — another user's wallet
+### Expect: 403
+### -------------------------------------------------------------------------
+GET {{host}}/api/ledger/REPLACE_WITH_ANOTHER_USERS_WALLET_UUID
+Authorization: Bearer {{bearer}}
+Accept: {{contentType}}
+
+### -------------------------------------------------------------------------
+### 12. WEBHOOK — unsigned request
+### Expect: 401 webhook_signature_missing
+### -------------------------------------------------------------------------
+POST {{host}}/api/webhooks/settlement
+Content-Type: {{contentType}}
+Accept: {{contentType}}
+
+{
+  "provider_reference": "unsigned-001",
+  "status": "COMPLETED",
+  "user_id": 1,
+  "currency": "NGN",
+  "amount_subunits": 50000
+}
+
+### -------------------------------------------------------------------------
+### 13. WEBHOOK — correctly signed
+###
+### The signature is HMAC-SHA256 over "{timestamp}.{raw body}". Generate a
+### matching pair with:
+###
+###   php artisan tinker --execute="
+###     \$ts = time();
+###     \$body = '{\"provider_reference\":\"settle-001\",\"status\":\"COMPLETED\",\"user_id\":1,\"currency\":\"NGN\",\"amount_subunits\":50000}';
+###     echo 'X-Tupay-Timestamp: '.\$ts.PHP_EOL;
+###     echo 'X-Tupay-Signature: '.hash_hmac('sha256', \$ts.'.'.\$body, config('tupay.webhooks.secret')).PHP_EOL;
+###   "
+###
+### The body below must match those bytes EXACTLY — reformatting it changes
+### the signed material and the signature will no longer verify.
+### Expect: 202 outcome=applied
+### -------------------------------------------------------------------------
+POST {{host}}/api/webhooks/settlement
+Content-Type: {{contentType}}
+Accept: {{contentType}}
+X-Tupay-Timestamp: REPLACE_ME
+X-Tupay-Signature: REPLACE_ME
+
+{"provider_reference":"settle-001","status":"COMPLETED","user_id":1,"currency":"NGN","amount_subunits":50000}
+
+### -------------------------------------------------------------------------
+### 14. WEBHOOK — same reference delivered twice (idempotency)
+### Re-send #13 verbatim with a fresh signature.
+### Expect: 200 outcome=duplicate, and NO second credit
+### -------------------------------------------------------------------------
+
+### -------------------------------------------------------------------------
+### 15. WEBHOOK — out-of-order: INITIATED arriving after COMPLETED
+### Same provider_reference as #13, but an earlier status.
+### Expect: 202 outcome=ignored_out_of_order, balance unchanged
+### -------------------------------------------------------------------------
+POST {{host}}/api/webhooks/settlement
+Content-Type: {{contentType}}
+Accept: {{contentType}}
+X-Tupay-Timestamp: REPLACE_ME
+X-Tupay-Signature: REPLACE_ME
+
+{"provider_reference":"settle-001","status":"INITIATED","user_id":1,"currency":"NGN","amount_subunits":50000}
+
+### -------------------------------------------------------------------------
+### 16. MOCK RATE PROVIDER — what the SWR cache fetches from
+### -------------------------------------------------------------------------
+GET {{host}}/api/mock/rates
+Accept: {{contentType}}
+
+### -------------------------------------------------------------------------
+### 17. LOGOUT
+### -------------------------------------------------------------------------
+POST {{host}}/api/logout
+Authorization: Bearer {{bearer}}
+Accept: {{contentType}}

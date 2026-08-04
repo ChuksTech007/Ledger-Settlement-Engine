@@ -1,0 +1,18 @@
+includes:
+    - vendor/larastan/larastan/extension.neon
+
+parameters:
+    level: 8
+
+    paths:
+        - app
+        - database
+        - routes
+        # Only our own configuration is analysed. Laravel's stock config files
+        # ship with env() calls PHPStan types as bool|string, which would emit
+        # dozens of errors in framework code we do not own and must not edit.
+        - config/tupay.php
+
+    # Iterable value types and generic class checks are implied by level 8 in
+    # PHPStan 2.x, so they are no longer configured explicitly.
+    treatPhpDocTypesAsCertain: false

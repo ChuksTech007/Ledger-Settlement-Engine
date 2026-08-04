@@ -1,0 +1,881 @@
+{
+  "info": {
+    "_postman_id": "b7c1f3e2-9a44-4d10-8f61-2c5b0d9e7a31",
+    "name": "Tupay — Ledger & Settlement Engine",
+    "description": "Verification collection for the Tupay assessment.\n\n## Before you start\n\n```bash\nphp artisan migrate:fresh --seed\nphp artisan serve\n```\n\n## What is automated\n\nTwo things normally make an API collection painful here, and both are handled by pre-request scripts so you never have to paste a value by hand:\n\n1. **TOTP codes** rotate every 30 seconds. `POST /2fa/challenge` computes a valid RFC-6238 code from the seeded base32 secret at request time.\n2. **Webhook signatures** are HMAC-SHA256 over `{timestamp}.{raw body}`. The webhook requests build the raw body, sign it, and set both headers themselves.\n\nBearer tokens, elevated action tokens, and wallet ids are captured into collection variables by test scripts, so requests can simply be run in order.\n\n## Suggested order\n\nRun the folders top to bottom. `Happy path` must run before `Attacks` and `Ledger`, because it populates the token and wallet variables.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://127.0.0.1:8000", "type": "string" },
+    { "key": "email", "value": "trader@tupay.test", "type": "string" },
+    { "key": "password", "value": "password", "type": "string" },
+    {
+      "key": "totpSecret",
+      "value": "KRSXG5CTMVRXEZLUGE3TCNZUGM2TSMBQ",
+      "type": "string",
+      "description": "Fixed seeder secret for trader@tupay.test"
+    },
+    {
+      "key": "webhookSecret",
+      "value": "tupay_local_webhook_secret_change_me",
+      "type": "string",
+      "description": "Must match TUPAY_WEBHOOK_SECRET in .env"
+    },
+    { "key": "bearer", "value": "", "type": "string" },
+    { "key": "eat", "value": "", "type": "string" },
+    { "key": "ngnWalletId", "value": "", "type": "string" },
+    { "key": "userId", "value": "", "type": "string" },
+    { "key": "swapAmount", "value": "1000000", "type": "string" }
+  ],
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// ---------------------------------------------------------------",
+          "// Shared helpers, available to every request in the collection.",
+          "// ---------------------------------------------------------------",
+          "",
+          "// RFC 4648 base32 -> hex, so CryptoJS can HMAC the raw seed.",
+          "// Authenticator secrets are base32, but HMAC needs bytes.",
+          "function base32ToHex(base32) {",
+          "    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';",
+          "    let bits = '';",
+          "    let hex = '';",
+          "",
+          "    const clean = base32.replace(/=+$/, '').toUpperCase();",
+          "",
+          "    for (let i = 0; i < clean.length; i++) {",
+          "        const val = alphabet.indexOf(clean.charAt(i));",
+          "        if (val === -1) { throw new Error('Invalid base32 character: ' + clean.charAt(i)); }",
+          "        bits += val.toString(2).padStart(5, '0');",
+          "    }",
+          "",
+          "    // Whole bytes only; a trailing partial group carries no data.",
+          "    for (let i = 0; i + 8 <= bits.length; i += 8) {",
+          "        hex += parseInt(bits.substr(i, 8), 2).toString(16).padStart(2, '0');",
+          "    }",
+          "",
+          "    return hex;",
+          "}",
+          "",
+          "// RFC 6238 TOTP: HMAC-SHA1 over the 30-second counter, then the",
+          "// standard dynamic-truncation step down to 6 digits.",
+          "function generateTotp(secret) {",
+          "    const CryptoJS = require('crypto-js');",
+          "",
+          "    const counter = Math.floor(Date.now() / 1000 / 30);",
+          "    const counterHex = counter.toString(16).padStart(16, '0');",
+          "",
+          "    const hmac = CryptoJS.HmacSHA1(",
+          "        CryptoJS.enc.Hex.parse(counterHex),",
+          "        CryptoJS.enc.Hex.parse(base32ToHex(secret))",
+          "    ).toString(CryptoJS.enc.Hex);",
+          "",
+          "    // Low 4 bits of the last byte select where to read the 4-byte code.",
+          "    const offset = parseInt(hmac.substr(hmac.length - 1), 16);",
+          "    const binary = parseInt(hmac.substr(offset * 2, 8), 16) & 0x7fffffff;",
+          "",
+          "    return (binary % 1000000).toString().padStart(6, '0');",
+          "}",
+          "",
+          "// Sign exactly what the middleware verifies: '{timestamp}.{raw body}'.",
+          "// The body must be sent byte-for-byte as signed — re-serialising it",
+          "// would change key order or spacing and invalidate the signature.",
+          "function signWebhook(rawBody) {",
+          "    const CryptoJS = require('crypto-js');",
+          "    const ts = Math.floor(Date.now() / 1000).toString();",
+          "",
+          "    const signature = CryptoJS.HmacSHA256(",
+          "        ts + '.' + rawBody,",
+          "        pm.collectionVariables.get('webhookSecret')",
+          "    ).toString(CryptoJS.enc.Hex);",
+          "",
+          "    pm.collectionVariables.set('webhookTimestamp', ts);",
+          "    pm.collectionVariables.set('webhookSignature', signature);",
+          "}",
+          "",
+          "this.base32ToHex = base32ToHex;",
+          "this.generateTotp = generateTotp;",
+          "this.signWebhook = signWebhook;"
+        ]
+      }
+    }
+  ],
+  "item": [
+    {
+      "name": "Happy path",
+      "description": "Login → challenge → swap. Run these in order; each populates variables the next one needs.",
+      "item": [
+        {
+          "name": "1. Login",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "",
+                  "const body = pm.response.json();",
+                  "",
+                  "pm.test('returns a bearer token', () => {",
+                  "    pm.expect(body.token_type).to.eql('Bearer');",
+                  "    pm.expect(body.access_token).to.be.a('string').and.not.empty;",
+                  "});",
+                  "",
+                  "pm.test('user is enrolled in TOTP', () => {",
+                  "    pm.expect(body.user.totp_enrolled).to.be.true;",
+                  "});",
+                  "",
+                  "pm.test('exposes wallet ids so the ledger is reachable', () => {",
+                  "    pm.expect(body.wallets).to.be.an('array').with.length.above(0);",
+                  "});",
+                  "",
+                  "pm.collectionVariables.set('bearer', body.access_token);",
+                  "pm.collectionVariables.set('userId', body.user.id);",
+                  "",
+                  "// Capture wallet ids so the Ledger folder needs no manual setup.",
+                  "const ngn = body.wallets.find(w => w.currency === 'NGN');",
+                  "const cny = body.wallets.find(w => w.currency === 'CNY');",
+                  "",
+                  "if (ngn) { pm.collectionVariables.set('ngnWalletId', ngn.id); }",
+                  "if (cny) { pm.collectionVariables.set('cnyWalletId', cny.id); }"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"{{email}}\",\n  \"password\": \"{{password}}\",\n  \"device_name\": \"postman\"\n}"
+            },
+            "url": { "raw": "{{baseUrl}}/api/login", "host": ["{{baseUrl}}"], "path": ["api", "login"] },
+            "description": "Exchanges credentials for a Sanctum bearer token. This token is sufficient for read-only endpoints and deliberately NOT sufficient for /api/swap."
+          }
+        },
+        {
+          "name": "2. 2FA challenge → mint EAT",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Compute a live TOTP code from the seeded secret.",
+                  "const code = generateTotp(pm.collectionVariables.get('totpSecret'));",
+                  "pm.collectionVariables.set('totpCode', code);",
+                  "console.log('TOTP code for this request:', code);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "",
+                  "const body = pm.response.json();",
+                  "",
+                  "pm.test('token expires in 60 seconds', () => {",
+                  "    pm.expect(body.expires_in).to.eql(60);",
+                  "});",
+                  "",
+                  "pm.test('bound to a SHA-256 action hash', () => {",
+                  "    pm.expect(body.action_hash).to.have.lengthOf(64);",
+                  "});",
+                  "",
+                  "pm.test('token is signed (payload.signature)', () => {",
+                  "    pm.expect(body.elevated_action_token).to.include('.');",
+                  "});",
+                  "",
+                  "pm.collectionVariables.set('eat', body.elevated_action_token);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{bearer}}" },
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"totp_code\": \"{{totpCode}}\",\n  \"action\": \"swap\",\n  \"action_payload\": {\n    \"source_currency\": \"NGN\",\n    \"target_currency\": \"CNY\",\n    \"amount_subunits\": {{swapAmount}}\n  }\n}"
+            },
+            "url": { "raw": "{{baseUrl}}/api/2fa/challenge", "host": ["{{baseUrl}}"], "path": ["api", "2fa", "challenge"] },
+            "description": "Spends a TOTP code and returns an Elevated Action Token bound to a SHA-256 hash of these exact parameters and this exact user. The raw TOTP code never travels with the swap itself."
+          }
+        },
+        {
+          "name": "3. Swap (succeeds, consumes the EAT)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "",
+                  "const body = pm.response.json();",
+                  "",
+                  "pm.test('below the slippage threshold, so no spread', () => {",
+                  "    pm.expect(body.slippage_bps).to.eql(0);",
+                  "});",
+                  "",
+                  "pm.test('target wallet was credited', () => {",
+                  "    pm.expect(body.target.credited_subunits).to.be.above(0);",
+                  "});",
+                  "",
+                  "pm.test('balances are reported as derived values', () => {",
+                  "    pm.expect(body.balances).to.have.property('NGN');",
+                  "    pm.expect(body.balances).to.have.property('CNY');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{bearer}}" },
+              { "key": "X-Elevated-Action-Token", "value": "{{eat}}" },
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"source_currency\": \"NGN\",\n  \"target_currency\": \"CNY\",\n  \"amount_subunits\": {{swapAmount}}\n}"
+            },
+            "url": { "raw": "{{baseUrl}}/api/swap", "host": ["{{baseUrl}}"], "path": ["api", "swap"] },
+            "description": "Posts four balanced ledger legs: debit user NGN, credit system NGN, debit system CNY, credit user CNY. Each currency nets to zero independently."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Attacks",
+      "description": "Every one of these must fail. Run 'Happy path' first — several reuse the now-spent EAT deliberately.",
+      "item": [
+        {
+          "name": "Swap with no elevated token → 401",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('401 Unauthorized', () => pm.response.to.have.status(401));",
+                  "pm.test('error is elevated_token_missing', () => {",
+                  "    pm.expect(pm.response.json().error).to.eql('elevated_token_missing');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{bearer}}" },
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"source_currency\": \"NGN\",\n  \"target_currency\": \"CNY\",\n  \"amount_subunits\": {{swapAmount}}\n}"
+            },
+            "url": { "raw": "{{baseUrl}}/api/swap", "host": ["{{baseUrl}}"], "path": ["api", "swap"] },
+            "description": "A valid bearer token is NOT sufficient for a sensitive action."
+          }
+        },
+        {
+          "name": "Replay the spent EAT → 401",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('401 Unauthorized', () => pm.response.to.have.status(401));",
+                  "pm.test('error is elevated_token_replayed', () => {",
+                  "    pm.expect(pm.response.json().error).to.eql('elevated_token_replayed');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{bearer}}" },
+              { "key": "X-Elevated-Action-Token", "value": "{{eat}}" },
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"source_currency\": \"NGN\",\n  \"target_currency\": \"CNY\",\n  \"amount_subunits\": {{swapAmount}}\n}"
+            },
+            "url": { "raw": "{{baseUrl}}/api/swap", "host": ["{{baseUrl}}"], "path": ["api", "swap"] },
+            "description": "The same token used in Happy path #3, still inside its 60-second TTL. It was atomically consumed by GETDEL on first read, so Redis no longer holds it."
+          }
+        },
+        {
+          "name": "Parameter substitution → 422",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Mint a FRESH token for 1,000,000 kobo, then attempt to spend",
+                  "// it on 100x that amount. This is the attack the action hash",
+                  "// exists to defeat.",
+                  "const code = generateTotp(pm.collectionVariables.get('totpSecret'));",
+                  "",
+                  "pm.sendRequest({",
+                  "    url: pm.collectionVariables.get('baseUrl') + '/api/2fa/challenge',",
+                  "    method: 'POST',",
+                  "    header: {",
+                  "        'Authorization': 'Bearer ' + pm.collectionVariables.get('bearer'),",
+                  "        'Content-Type': 'application/json',",
+                  "        'Accept': 'application/json'",
+                  "    },",
+                  "    body: {",
+                  "        mode: 'raw',",
+                  "        raw: JSON.stringify({",
+                  "            totp_code: code,",
+                  "            action: 'swap',",
+                  "            action_payload: {",
+                  "                source_currency: 'NGN',",
+                  "                target_currency: 'CNY',",
+                  "                amount_subunits: 1000000",
+                  "            }",
+                  "        })",
+                  "    }",
+                  "}, (err, res) => {",
+                  "    if (err) { console.error(err); return; }",
+                  "    if (res.code !== 201) {",
+                  "        console.warn('Challenge failed (' + res.code + '). A TOTP code is single-use — wait for the next 30s window.');",
+                  "        return;",
+                  "    }",
+                  "    pm.collectionVariables.set('freshEat', res.json().elevated_action_token);",
+                  "});"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('422 Unprocessable Entity', () => pm.response.to.have.status(422));",
+                  "pm.test('error is elevated_token_action_mismatch', () => {",
+                  "    pm.expect(pm.response.json().error).to.eql('elevated_token_action_mismatch');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{bearer}}" },
+              { "key": "X-Elevated-Action-Token", "value": "{{freshEat}}" },
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"source_currency\": \"NGN\",\n  \"target_currency\": \"CNY\",\n  \"amount_subunits\": 100000000\n}"
+            },
+            "url": { "raw": "{{baseUrl}}/api/swap", "host": ["{{baseUrl}}"], "path": ["api", "swap"] },
+            "description": "An authentic, unspent token approved for ₦10,000 is pointed at a ₦1,000,000 swap. The recomputed SHA-256 hash does not match what was approved, so the request is refused."
+          }
+        },
+        {
+          "name": "Forged token → 401",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('401 Unauthorized', () => pm.response.to.have.status(401));",
+                  "pm.test('rejected before Redis is touched', () => {",
+                  "    pm.expect(pm.response.json().error).to.be.oneOf([",
+                  "        'elevated_token_malformed',",
+                  "        'elevated_token_signature_invalid'",
+                  "    ]);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{bearer}}" },
+              { "key": "X-Elevated-Action-Token", "value": "Zm9yZ2Vk.c2lnbmF0dXJl" },
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"source_currency\": \"NGN\",\n  \"target_currency\": \"CNY\",\n  \"amount_subunits\": {{swapAmount}}\n}"
+            },
+            "url": { "raw": "{{baseUrl}}/api/swap", "host": ["{{baseUrl}}"], "path": ["api", "swap"] },
+            "description": "HMAC verification fails, so this is rejected without any Redis lookup at all."
+          }
+        },
+        {
+          "name": "Wrong password → 422 (no user enumeration)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('422 Unprocessable Entity', () => pm.response.to.have.status(422));",
+                  "pm.test('message does not reveal whether the account exists', () => {",
+                  "    pm.expect(pm.response.text()).to.not.include('not found');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"{{email}}\",\n  \"password\": \"definitely-wrong\"\n}"
+            },
+            "url": { "raw": "{{baseUrl}}/api/login", "host": ["{{baseUrl}}"], "path": ["api", "login"] },
+            "description": "An unknown email is compared against a fixed bcrypt digest so the failure path costs the same as a real check — response timing cannot be used to enumerate accounts."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Ledger",
+      "item": [
+        {
+          "name": "Fetch wallet id (helper)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// The swap response reports balances but not wallet ids, so this",
+                  "// helper reads one from a swap and stores it for the ledger calls.",
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "",
+                  "const body = pm.response.json();",
+                  "if (body.wallet && body.wallet.id) {",
+                  "    pm.collectionVariables.set('ngnWalletId', body.wallet.id);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{bearer}}" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/ledger/{{ngnWalletId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "ledger", "{{ngnWalletId}}"]
+            },
+            "description": "Set {{ngnWalletId}} first. Get it from:\n\n  php artisan tinker --execute=\"echo App\\Models\\User::where('email','trader@tupay.test')->first()->walletFor(App\\Domain\\Money\\Currency::NGN)->id;\""
+          }
+        },
+        {
+          "name": "Paginated ledger (keyset cursor)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "",
+                  "const body = pm.response.json();",
+                  "",
+                  "pm.test('reports a derived balance', () => {",
+                  "    pm.expect(body.wallet).to.have.property('balance_subunits');",
+                  "    pm.expect(body.wallet.balance_subunits).to.be.a('number');",
+                  "});",
+                  "",
+                  "pm.test('entries are newest first', () => {",
+                  "    const ids = body.data.map(e => e.id);",
+                  "    const sorted = [...ids].sort((a, b) => b - a);",
+                  "    pm.expect(ids).to.eql(sorted);",
+                  "});",
+                  "",
+                  "pm.test('exposes a keyset cursor, not an offset', () => {",
+                  "    pm.expect(body.pagination).to.have.property('next_cursor');",
+                  "    pm.expect(body.pagination).to.have.property('has_more');",
+                  "});",
+                  "",
+                  "if (body.pagination.next_cursor) {",
+                  "    pm.collectionVariables.set('cursor', body.pagination.next_cursor);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{bearer}}" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/ledger/{{ngnWalletId}}?per_page=5",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "ledger", "{{ngnWalletId}}"],
+              "query": [{ "key": "per_page", "value": "5" }]
+            }
+          }
+        },
+        {
+          "name": "Next page via cursor",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "",
+                  "const body = pm.response.json();",
+                  "const cursor = Number(pm.collectionVariables.get('cursor'));",
+                  "",
+                  "pm.test('every entry is strictly older than the cursor', () => {",
+                  "    body.data.forEach(e => pm.expect(e.id).to.be.below(cursor));",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{bearer}}" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/ledger/{{ngnWalletId}}?per_page=5&cursor={{cursor}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "ledger", "{{ngnWalletId}}"],
+              "query": [
+                { "key": "per_page", "value": "5" },
+                { "key": "cursor", "value": "{{cursor}}" }
+              ]
+            },
+            "description": "Pages cannot overlap: the cursor is anchored to a monotonic id, so a concurrent insert cannot shift rows between pages the way OFFSET does."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Settlement webhooks",
+      "description": "Signatures are computed automatically. The raw body is built in the pre-request script and sent byte-for-byte as signed.",
+      "item": [
+        {
+          "name": "Unsigned → 401",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('401 Unauthorized', () => pm.response.to.have.status(401));",
+                  "pm.test('error is webhook_signature_missing', () => {",
+                  "    pm.expect(pm.response.json().error).to.eql('webhook_signature_missing');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"provider_reference\":\"unsigned-001\",\"status\":\"COMPLETED\",\"user_id\":1,\"currency\":\"NGN\",\"amount_subunits\":50000}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/webhooks/settlement",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "webhooks", "settlement"]
+            }
+          }
+        },
+        {
+          "name": "Signed COMPLETED → 202 applied",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// A unique reference per run, so repeated collection runs do not",
+                  "// collide with an already-settled event.",
+                  "const ref = 'pm-settle-' + Date.now();",
+                  "pm.collectionVariables.set('settleRef', ref);",
+                  "",
+                  "const raw = JSON.stringify({",
+                  "    provider_reference: ref,",
+                  "    status: 'COMPLETED',",
+                  "    user_id: Number(pm.collectionVariables.get('userId')),",
+                  "    currency: 'NGN',",
+                  "    amount_subunits: 50000",
+                  "});",
+                  "",
+                  "pm.collectionVariables.set('settleBody', raw);",
+                  "signWebhook(raw);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('202 Accepted', () => pm.response.to.have.status(202));",
+                  "pm.test('outcome is applied', () => {",
+                  "    pm.expect(pm.response.json().outcome).to.eql('applied');",
+                  "});",
+                  "pm.test('ledger posting was queued, not done inline', () => {",
+                  "    pm.expect(pm.response.json().queued).to.be.true;",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json" },
+              { "key": "X-Tupay-Timestamp", "value": "{{webhookTimestamp}}" },
+              { "key": "X-Tupay-Signature", "value": "{{webhookSignature}}" }
+            ],
+            "body": { "mode": "raw", "raw": "{{settleBody}}" },
+            "url": {
+              "raw": "{{baseUrl}}/api/webhooks/settlement",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "webhooks", "settlement"]
+            },
+            "description": "HMAC-SHA256 over '{timestamp}.{raw body}'. Including the timestamp inside the signed material is what allows a captured request to be rejected on age while its signature still verifies."
+          }
+        },
+        {
+          "name": "Duplicate delivery → 200 duplicate",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Exactly the same reference and status as the previous request,",
+                  "// re-signed with a current timestamp.",
+                  "signWebhook(pm.collectionVariables.get('settleBody'));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('recognised as a duplicate', () => {",
+                  "    pm.expect(pm.response.json().outcome).to.eql('duplicate');",
+                  "});",
+                  "pm.test('no second credit was queued', () => {",
+                  "    pm.expect(pm.response.json().queued).to.be.false;",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json" },
+              { "key": "X-Tupay-Timestamp", "value": "{{webhookTimestamp}}" },
+              { "key": "X-Tupay-Signature", "value": "{{webhookSignature}}" }
+            ],
+            "body": { "mode": "raw", "raw": "{{settleBody}}" },
+            "url": {
+              "raw": "{{baseUrl}}/api/webhooks/settlement",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "webhooks", "settlement"]
+            },
+            "description": "Idempotency is enforced by a UNIQUE index on provider_reference, caught as a constraint violation rather than a check-then-insert that has a race window."
+          }
+        },
+        {
+          "name": "Out-of-order INITIATED → 202 ignored",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// The same settlement, but an EARLIER status arriving late.",
+                  "const raw = JSON.stringify({",
+                  "    provider_reference: pm.collectionVariables.get('settleRef'),",
+                  "    status: 'INITIATED',",
+                  "    user_id: Number(pm.collectionVariables.get('userId')),",
+                  "    currency: 'NGN',",
+                  "    amount_subunits: 50000",
+                  "});",
+                  "",
+                  "pm.collectionVariables.set('lateBody', raw);",
+                  "signWebhook(raw);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('202 Accepted', () => pm.response.to.have.status(202));",
+                  "pm.test('does not walk the settlement backwards', () => {",
+                  "    pm.expect(pm.response.json().outcome).to.eql('ignored_out_of_order');",
+                  "    pm.expect(pm.response.json().status).to.eql('COMPLETED');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json" },
+              { "key": "X-Tupay-Timestamp", "value": "{{webhookTimestamp}}" },
+              { "key": "X-Tupay-Signature", "value": "{{webhookSignature}}" }
+            ],
+            "body": { "mode": "raw", "raw": "{{lateBody}}" },
+            "url": {
+              "raw": "{{baseUrl}}/api/webhooks/settlement",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "webhooks", "settlement"]
+            },
+            "description": "Providers retry per event and the network reorders freely, so a COMPLETED can land before its INITIATED. The state machine compares rank rather than trusting arrival order, so a late earlier status is recorded as seen but cannot trigger a re-credit."
+          }
+        },
+        {
+          "name": "Stale timestamp → 401",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Correctly signed, but an hour old — outside the replay window.",
+                  "const CryptoJS = require('crypto-js');",
+                  "",
+                  "const raw = JSON.stringify({",
+                  "    provider_reference: 'pm-stale-' + Date.now(),",
+                  "    status: 'COMPLETED',",
+                  "    user_id: Number(pm.collectionVariables.get('userId')),",
+                  "    currency: 'NGN',",
+                  "    amount_subunits: 50000",
+                  "});",
+                  "",
+                  "const ts = (Math.floor(Date.now() / 1000) - 3600).toString();",
+                  "",
+                  "pm.collectionVariables.set('staleBody', raw);",
+                  "pm.collectionVariables.set('staleTimestamp', ts);",
+                  "pm.collectionVariables.set('staleSignature', CryptoJS.HmacSHA256(",
+                  "    ts + '.' + raw,",
+                  "    pm.collectionVariables.get('webhookSecret')",
+                  ").toString(CryptoJS.enc.Hex));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('401 Unauthorized', () => pm.response.to.have.status(401));",
+                  "pm.test('rejected on age, not on signature', () => {",
+                  "    pm.expect(pm.response.json().error).to.eql('webhook_timestamp_expired');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json" },
+              { "key": "X-Tupay-Timestamp", "value": "{{staleTimestamp}}" },
+              { "key": "X-Tupay-Signature", "value": "{{staleSignature}}" }
+            ],
+            "body": { "mode": "raw", "raw": "{{staleBody}}" },
+            "url": {
+              "raw": "{{baseUrl}}/api/webhooks/settlement",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "webhooks", "settlement"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Utility",
+      "item": [
+        {
+          "name": "Mock rate provider",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Accept", "value": "application/json" }],
+            "url": { "raw": "{{baseUrl}}/api/mock/rates", "host": ["{{baseUrl}}"], "path": ["api", "mock", "rates"] },
+            "description": "Stands in for the external provider. Jittered by ±0.5% so a broken cache cannot look correct."
+          }
+        },
+        {
+          "name": "Logout",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{bearer}}" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": { "raw": "{{baseUrl}}/api/logout", "host": ["{{baseUrl}}"], "path": ["api", "logout"] }
+          }
+        }
+      ]
+    }
+  ]
+}

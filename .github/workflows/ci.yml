@@ -1,0 +1,167 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  quality:
+    name: Static analysis & style
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up PHP 8.2
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          extensions: bcmath, pdo_pgsql, redis, zip
+          coverage: none
+
+      - name: Install dependencies
+        run: composer install --no-interaction --prefer-dist --no-progress
+
+      - name: Laravel Pint (style)
+        run: vendor/bin/pint --test
+
+      - name: PHPStan (level 8)
+        run: vendor/bin/phpstan analyse --memory-limit=1G --no-progress
+
+  tests:
+    name: Test suite
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: tupay_secret
+          POSTGRES_DB: tupay_test
+        ports: ['5433:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up PHP 8.2
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          # phpredis here (rather than predis) deliberately: local development
+          # runs the pure-PHP client, so exercising the C extension in CI means
+          # both drivers are proven rather than only the convenient one.
+          extensions: bcmath, pdo_pgsql, redis, zip
+          coverage: none
+
+      - name: Install dependencies
+        run: composer install --no-interaction --prefer-dist --no-progress
+
+      - name: Prepare environment
+        run: |
+          cp .env.example .env
+          php artisan key:generate
+
+      - name: Run migrations
+        env:
+          DB_CONNECTION: pgsql
+          DB_HOST: 127.0.0.1
+          DB_PORT: 5433
+          DB_DATABASE: tupay_test
+          DB_USERNAME: postgres
+          DB_PASSWORD: tupay_secret
+        run: php artisan migrate --force
+
+      - name: Unit & Feature suites
+        run: vendor/bin/pest --testsuite=Unit,Feature
+
+  concurrency:
+    name: Race condition (10 parallel swaps)
+    runs-on: ubuntu-latest
+    needs: tests
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: tupay_secret
+          POSTGRES_DB: tupay
+        ports: ['5433:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up PHP 8.2
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          extensions: bcmath, pdo_pgsql, redis, zip
+          coverage: none
+
+      - name: Install dependencies
+        run: composer install --no-interaction --prefer-dist --no-progress
+
+      - name: Prepare environment
+        run: |
+          cp .env.example .env
+          php artisan key:generate
+          php artisan migrate --force --seed
+
+      - name: Start a genuinely concurrent server
+        # PHP_CLI_SERVER_WORKERS forks worker processes so the CLI server can
+        # handle requests in parallel. It is POSIX-only, which is exactly why
+        # the authoritative concurrency run happens here on Linux rather than
+        # on a Windows development machine, where the flag is ignored and the
+        # ten requests would be silently serialised.
+        env:
+          PHP_CLI_SERVER_WORKERS: 10
+        run: |
+          php artisan serve --host=127.0.0.1 --port=8000 &
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8000/up > /dev/null; then
+              echo "server up after ${i} attempt(s)"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "server failed to start" && exit 1
+
+      - name: Race condition test
+        # Asserts exactly 1x 200 and exactly 9x 409/422, zero overdraft, and a
+        # ledger that still nets to zero in every currency.
+        env:
+          STRESS_TEST_BASE_URL: http://127.0.0.1:8000
+          STRESS_TEST_DB: tupay
+          STRESS_TEST_REDIS_DB: 0
+        run: vendor/bin/pest --testsuite=Stress
