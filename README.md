@@ -414,6 +414,27 @@ either way, but only the former exercises the concurrency guard.
 
 ---
 
+## A note on the committed test fixtures
+
+Secret scanners flag several high-entropy strings in this repository. They are
+test fixtures, and they are deliberate:
+
+- **Three base32 TOTP secrets in `DatabaseSeeder.php`.** The brief requires
+  "database seeders providing test users initialized with valid TOTP secrets".
+  They are fixed rather than random so a reviewer can generate a valid code
+  straight from this README without first querying the database. They authorise
+  nothing beyond a locally seeded account.
+- **A bcrypt digest in `AuthController.php`.** Login compares an unknown email
+  against this fixed hash so the failure path costs the same as a real check,
+  which prevents account enumeration by response timing. It is the hash of a
+  throwaway string, not of any password.
+- **`.env.example` placeholders** (`tupay_secret`, `..._change_me`). Local
+  development defaults, marked as such.
+
+No real credential is committed: `.env` is gitignored, and `APP_KEY` is empty in
+`.env.example` and generated per environment by `php artisan key:generate`.
+`TUPAY_WEBHOOK_SECRET` must be replaced before any deployment.
+
 ## Honest limitations
 
 **The local stress run does not prove concurrency safety on Windows.**
